@@ -185,7 +185,10 @@ static int sockErrorQueueProcess(int fd) {
 
     controlErrorMsg = CMSG_FIRSTHDR(&messageError);
     while(controlErrorMsg != NULL) {
-        sockErrorQueue = (void *) CMSG_DATA(controlErrorMsg);
+        #ifndef	UA_ENABLE_PUBSUB_CUSTOM_PUBLISH_HANDLING
+	sockErrorQueue = (void *) CMSG_DATA(controlErrorMsg);
+	#endif
+        sockErrorQueue = (struct sock_extended_err *) CMSG_DATA(controlErrorMsg);
         if(sockErrorQueue->ee_origin == SO_EE_ORIGIN_TXTIME) {
             timeStamp = ((__u64) sockErrorQueue->ee_data << SHIFT_32BITS) + sockErrorQueue->ee_info;
             switch(sockErrorQueue->ee_code) {
