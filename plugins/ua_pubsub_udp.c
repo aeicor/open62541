@@ -10,7 +10,7 @@
 #include <open62541/plugin/pubsub_udp.h>
 #include <open62541/util.h>
 
-#define  PUBSUB_IP_ADDRESS    "192.168.9.10"
+#define  PUBSUB_IP_ADDRESS    "192.168.1.10"
 
 // UDP multicast network layer specific internal data
 typedef struct {

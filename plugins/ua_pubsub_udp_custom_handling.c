@@ -45,7 +45,7 @@
 #endif
 
 #define       MULTICAST_ADDRESS                  "224.0.0.32"
-#define       PUBSUB_IP_ADDRESS                  "192.168.9.10"
+#define       PUBSUB_IP_ADDRESS                  "192.168.1.10"
 
 #define       PRINT_ERROR(ERROR_INFO)            fprintf(stderr, ERROR_INFO "\n")
 
@@ -56,7 +56,7 @@ ssize_t       dataCount;
 UA_Int32      errorCount;
 __u64         txtime;
 /* Qbv offset is 5us for i5. For Mbox, qbv offset is 25us */
-__u64              qbv_offset      = 25 * 1000;
+__u64              qbv_offset      = 0;
 UA_Int32           waketx_delay    = 50000;
 static UA_Int32    txTimeEnable    = 1;
 static UA_Int32    soPriority      = 3;
