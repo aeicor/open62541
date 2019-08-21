@@ -40,10 +40,10 @@
 
 /* These defines enables the publisher and subscriber of the OPCUA stack */
 /* To run only publisher, enable PUBLISHER define alone (comment SUBSCRIBER) */
-#define             PUBLISHER
+//#define             PUBLISHER
 /* To run only subscriber, enable SUBSCRIBER define alone
  * (comment PUBLISHER) */
-//#define             SUBSCRIBER
+#define             SUBSCRIBER
 /* Use server interrupt or system interrupt? */
 #define             PUB_SYSTEM_INTERRUPT
 /* Publish interval in milliseconds */
@@ -86,10 +86,10 @@
  */
 #define             PUBSUB_IP_ADDRESS              "192.168.1.10"
 #if defined(PUBLISHER)
-#define             PUBLISHER_MULTICAST_ADDRESS    "opc.udp://224.0.0.32:4840/"
+#define             PUBLISHER_MULTICAST_ADDRESS    "opc.udp://224.0.0.22:4840/"
 #endif
 #if defined(SUBSCRIBER)
-#define             SUBSCRIBER_MULTICAST_ADDRESS   "opc.udp://224.0.0.22:4840/"
+#define             SUBSCRIBER_MULTICAST_ADDRESS   "opc.udp://224.0.0.32:4840/"
 #endif
 /* Variable for next cycle start time */
 struct timespec              nextCycleStartTime;
@@ -121,13 +121,13 @@ static void addServerNodes(UA_Server* server);
 /* For deleting the nodes created */
 static void removeServerNodes(UA_Server *server);
 
+/* To lock the thread */
+pthread_mutex_t              lock;
+
 #if defined(PUBLISHER)
 /* File to store the data and timestamps for different traffic */
 FILE*                        fpPublisher;
 char*                        filePublishedData      = "publisher_T1.csv";
-
-/* To lock the thread */
-pthread_mutex_t              lock;
 
 /* Thread for publisher */
 pthread_t                    pubThreadID;
@@ -804,14 +804,6 @@ int main(void) {
     if(CPU_ISSET(CORE_THREE, &cpusetSub)) {
         printf("CPU %d\n", CORE_THREE);
     }
-
-    /* Create the subscriber thread */
-    returnValue                          = pthread_create(&subThreadID, NULL,
-                                                          &subscriber, NULL);
-    if (returnValue != 0) {
-        printf("Subscriber thread cannot be created\n");
-    }
-
 #endif
 
 #if defined(PUBLISHER) || defined(SUBSCRIBER)
