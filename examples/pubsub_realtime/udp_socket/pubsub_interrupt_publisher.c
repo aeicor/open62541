@@ -40,12 +40,12 @@
 
 /* These defines enables the publisher and subscriber of the OPCUA stack */
 /* To run only publisher, enable PUBLISHER define alone (comment SUBSCRIBER) */
-//#define             PUBLISHER
+#define             PUBLISHER
 /* To run only subscriber, enable SUBSCRIBER define alone
  * (comment PUBLISHER) */
-#define             SUBSCRIBER
+//#define             SUBSCRIBER
 /* Use server interrupt or system interrupt? */
-#define             PUB_SYSTEM_INTERRUPT
+//#define             PUB_SYSTEM_INTERRUPT
 /* Publish interval in milliseconds */
 #define             PUB_INTERVAL                    250
 /* Cycle time in ns. Eg: For 100us: 100*1000 */
@@ -141,7 +141,6 @@ struct sched_param           schedParamPublisher;
 
 /* Array to store timestamp */
 struct timespec              publishTimestamp[MAX_MEASUREMENTS];
-struct timespec              dataModificationTime;
 
 /* Publisher thread routine for ETF */
 void*                        publisherETF(void* arg);
@@ -183,62 +182,91 @@ static void stopHandler(int sign) {
     running = UA_FALSE;
 }
 
-#ifndef PUB_SYSTEM_INTERRUPT
-/*****************************/
-/* Server Event Loop Publish */
-/*****************************/
-/* Add a publishing callback function */
-static void publishCallback(UA_Server* server, void* data) {
-    struct timespec start_time;
-    struct timespec end_time;
+struct timespec              dataModificationTime;
 
-    clock_gettime(CLOCKID, &start_time);
-    pubCallback(server, data);
-    clock_gettime(CLOCKID, &end_time);
-    updateMeasurementsPublisher(start_time, end_time);
-}
+static void updateMeasurementsPublisher(struct timespec, UA_UInt64);
+
+static void nanoSecondFieldConversion(struct timespec *);
+
+#if defined(PUBLISHER)
+/*****************************/
+/* System Interrupt Callback */
+/*****************************/
+/* For one publish callback only... */
+UA_Server*      pubServer;
+void*           pubData;
 
 /* Add a callback for cyclic repetition */
 UA_StatusCode
 UA_PubSubManager_addRepeatedCallback(UA_Server *server, UA_ServerCallback callback,
                                      void *data, UA_Double interval_ms, UA_UInt64 *callbackId) {
-    pubIntervalNs = interval_ms * MILLI_SECONDS;
-    pubCallback = callback;
-    clock_gettime(CLOCKID, &pubStartTime);
-    return UA_Timer_addRepeatedCallback(&server->timer, (UA_TimerCallback)publishCallback,
-                                        data, interval_ms, callbackId);
+    pubServer                       = server;
+    pubCallback                     = callback;
+    pubData                         = data;
+    pubIntervalNs                   = (UA_Int64)interval_ms * MILLI_SECONDS;
+
+    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                "Created Publish Callback with interval %f", interval_ms);
+    return UA_STATUSCODE_GOOD;
 }
 
-/* Modify the interval of the callback for cyclic repetition */
 UA_StatusCode
 UA_PubSubManager_changeRepeatedCallbackInterval(UA_Server *server, UA_UInt64 callbackId,
                                                 UA_Double interval_ms) {
-    pubIntervalNs = interval_ms * MILLI_SECONDS;
-    return UA_Timer_changeRepeatedCallbackInterval(&server->timer, callbackId, interval_ms);
+    return UA_STATUSCODE_GOOD;
 }
 
 /* Remove the callback added for cyclic repetition */
-UAStatusCode
+void
 UA_PubSubManager_removeRepeatedPubSubCallback(UA_Server *server, UA_UInt64 callbackId) {
-    UA_Timer_removeCallback(&server->timer, callbackId);
+    
 }
+#endif
 
-#else
+
+#ifdef PUB_SYSTEM_INTERRUPT
 /*****************************/
 /* System Interrupt Callback */
 /*****************************/
-
 /* For one publish callback only... */
 UA_Server*      pubServer;
 void*           pubData;
 struct sigevent pubEvent;
 timer_t         pubEventTimer;
+int             firstTxTime = 1;
 
-static void handler(int sig, siginfo_t *si, void *uc) {
-    if(si->si_value.sival_ptr != &pubEventTimer) {
+static void handler(int sig, siginfo_t *si, void *uc) { 
+    firstTxTime++;
+    if (firstTxTime < 4)
+	return;
+
+    if(firstTxTime == 4)
+    {
+        clock_gettime(CLOCKID, &nextCycleStartTime);
+    	nextCycleStartTime.tv_sec += 0;
+
+    	nextCycleStartTime.tv_nsec += 1000000;
+    	nanoSecondFieldConversion(&nextCycleStartTime);
+    }
+    else
+    {
+        nextCycleStartTime.tv_nsec += CYCLE_TIME;
+        nanoSecondFieldConversion(&nextCycleStartTime);
+    }
+
+    pubCounterData++;
+
+    UA_Variant_setScalar(&pubCounter, &pubCounterData, &UA_TYPES[UA_TYPES_UINT64]);
+    UA_NodeId currentNodeId         = UA_NODEID_STRING(1, "PublisherCounter");
+    UA_Server_writeValue(pubServer, currentNodeId, pubCounter);
+    clock_gettime(CLOCKID, &dataModificationTime);
+    updateMeasurementsPublisher(dataModificationTime, pubCounterData);
+    pubCallback(pubServer, pubData);
+    if(si->si_value.sival_ptr != &pubEventTimer) { 
         UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "stray signal");
         return;
     }
+    
 }
 
 /* Add a callback for cyclic repetition */
@@ -271,9 +299,9 @@ UA_PubSubManager_addRepeatedCallback(UA_Server *server, UA_ServerCallback callba
     struct itimerspec timerspec;
 
     timerspec.it_interval.tv_sec   = 0;
-    timerspec.it_interval.tv_nsec  = pubIntervalNs;
+    timerspec.it_interval.tv_nsec  = 100000;
     timerspec.it_value.tv_sec      = 0;
-    timerspec.it_value.tv_nsec     = pubIntervalNs;
+    timerspec.it_value.tv_nsec     = 1;
     resultTimerCreate = timer_settime(pubEventTimer, 0, &timerspec, NULL);
     if(resultTimerCreate != 0) {
         UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Failed to arm the system timer");
@@ -295,7 +323,7 @@ UA_PubSubManager_changeRepeatedCallbackInterval(UA_Server *server, UA_UInt64 cal
     timerspec.it_interval.tv_sec  = 0;
     timerspec.it_interval.tv_nsec = pubIntervalNs;
     timerspec.it_value.tv_sec     = 0;
-    timerspec.it_value.tv_nsec    = pubIntervalNs;
+    timerspec.it_value.tv_nsec    = 0;
     int resultTimerCreate         = timer_settime(pubEventTimer, 0, &timerspec, NULL);
     if(resultTimerCreate != 0) {
         UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Failed to arm the system timer");
@@ -311,6 +339,7 @@ UA_PubSubManager_changeRepeatedCallbackInterval(UA_Server *server, UA_UInt64 cal
 /* Remove the callback added for cyclic repetition */
 void
 UA_PubSubManager_removeRepeatedPubSubCallback(UA_Server *server, UA_UInt64 callbackId) {
+	printf("Timer event deleted\n");
     timer_delete(pubEventTimer);
 }
 #endif
