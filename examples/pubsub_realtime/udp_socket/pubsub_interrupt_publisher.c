@@ -23,7 +23,6 @@
  *         ----------------------------------------------------------------
  */
 
-
 #include <signal.h>
 #include <time.h>
 #include <stdio.h>
@@ -32,26 +31,44 @@
 /* For thread operations */
 #include <pthread.h>
 
+/* These defines enables the publisher and subscriber of the OPCUA stack */
 #include <open62541/server.h>
 #include <open62541/server_config_default.h>
 #include <ua_server_internal.h>
 #include <open62541/plugin/pubsub_udp.h>
 #include <open62541/plugin/log_stdout.h>
 
-/* These defines enables the publisher and subscriber of the OPCUA stack */
-/* To run only publisher, enable PUBLISHER define alone (comment SUBSCRIBER) */
+/* To run thread based publisher
+ * uncomment: PUBLISHER
+ * comment:SUBSCRIBER, PUB_SYSTEM_INTERRUPT
+ */
+
 //#define             PUBLISHER
-/* To run only subscriber, enable SUBSCRIBER define alone
- * (comment PUBLISHER) */
-//#define             SUBSCRIBER
-/* Use server interrupt or system interrupt? */
+
+/* To run thread based standalone subscriber
+ * uncomment: SUBSCRIBER
+ * comment: PUBLISHER, PUB_SYSTEM_INTERRUPT
+ */
+
+#define             SUBSCRIBER
+
+/* To run interrupt based standalone publisher
+ * uncomment: PUB_SYSTEM_INTERRUPT
+ * comment: PUBLISHER, SUBSCRIBER
+ */
 #define             PUB_SYSTEM_INTERRUPT
-/* Publish interval in milliseconds */
+
+/* Note: To run publisher/interrupt_publisher and subscriber
+ * uncomment: SUBSCRIBER, PUB_SYSTEM_INTERRUPT/PUBLISHER
+ * comment: PUB_SYSTEM_INTERRUPT/PUBLISHER
+ * Only one publisher can be started
+ */
+
+/* Publish interval in milliseconds- Now @100us */
 #define             PUB_INTERVAL                    0.1
-/* Cycle time in ns. Eg: For 100us: 100*1000 */
-#define             CYCLE_TIME                      100 * 1000
 #define             FIVE_MICRO_SECOND               5
 #define             MILLI_SECONDS                   1000 * 1000
+#define             CYCLE_TIME                      (long)(PUB_INTERVAL * MILLI_SECONDS)
 #define             SECONDS                         1000 * 1000 * 1000
 #define             PUB_SCHED_PRIORITY              87
 #define             SUB_SCHED_PRIORITY              88
@@ -62,7 +79,7 @@
 #define             NETWORK_MSG_COUNT               1
 #define             CORE_TWO                        2
 #define             CORE_THREE                      3
-#define             ONE                             1
+#define             ONE_SECOND                      1
 #define             CONNECTION_NUMBER               2
 #define             PORT_NUMBER                     62541
 #define             FAILURE_EXIT                    -1
@@ -78,12 +95,12 @@
  * UA_ENABLE_PUBSUB_CUSTOM_PUBLISH_HANDLING_TSN is enabled,
  * change in line number 46 in plugins/ua_pubsub_udp_custom_handling.c
  */
-#define             PUBSUB_IP_ADDRESS              "192.168.1.10"
+#define             PUBSUB_IP_ADDRESS              "192.168.1.11"
 #if defined(PUBLISHER) || defined(PUB_SYSTEM_INTERRUPT)
-#define             PUBLISHER_MULTICAST_ADDRESS    "opc.udp://224.0.0.22:4840/"
+#define             PUBLISHER_MULTICAST_ADDRESS    "opc.udp://224.0.0.32:4840/"
 #endif
 #if defined(SUBSCRIBER)
-#define             SUBSCRIBER_MULTICAST_ADDRESS   "opc.udp://224.0.0.32:4840/"
+#define             SUBSCRIBER_MULTICAST_ADDRESS   "opc.udp://224.0.0.22:4840/"
 #endif
 
 /* Set server running as true */
@@ -91,19 +108,16 @@ UA_Boolean                   running                = UA_TRUE;
 
 /* Variables corresponding to PubSub connection creation,
  * published data set and writer group */
-UA_PubSubConnection*         connection;
-UA_NodeId                    connectionIdent;
-UA_NodeId                    publishedDataSetIdent;
-UA_NodeId                    writerGroupIdent;
 UA_NodeId                    pubNodeID;
 UA_NodeId                    subNodeID;
-/* Variable for PubSub callback */
-UA_ServerCallback            pubCallback;
+
 /* Variables for counter data handling in address space */
 UA_UInt64                    pubCounterData         = 0;
-UA_UInt64                    subCounterData         = 0;
 UA_Variant                   pubCounter;
 UA_Variant                   subCounter;
+
+/* Extern variable for next cycle start time(SO_TXTIME) */
+struct timespec              nextCycleStartTime;
 
 /* For adding nodes in the server information model */
 static void addServerNodes(UA_Server* server);
@@ -113,14 +127,11 @@ static void removeServerNodes(UA_Server *server);
 
 #if defined(PUBLISHER)
 
-/* To lock the thread */
-pthread_mutex_t              lock;
+/* Thread for subscriber */
+pthread_t                    pubThreadID;
 
 /* Process scheduling parameter for publisher */
 struct sched_param           schedParamPublisher;
-
-/* Thread for subscriber */
-pthread_t                    pubThreadID;
 
 /* Publisher thread routine for ETF */
 void*                        publisherETF(void* arg);
@@ -128,8 +139,7 @@ void*                        publisherETF(void* arg);
 
 #if defined(PUB_SYSTEM_INTERRUPT)
 
-/* signal and event timer */
-struct sigevent              pubEvent;
+/* event timer */
 timer_t                      pubEventTimer;
 
 /* calculating firstTxtime */
@@ -140,17 +150,15 @@ UA_Int64                     pubIntervalNs;
 
 /* Handle the signal */
 struct                       sigaction sa;
-
 struct timespec              pubStartTime;
+
+/* signal */
+struct sigevent              pubEvent;
+
 #endif
 
 
 #if defined(PUBLISHER) || defined(PUB_SYSTEM_INTERRUPT)
-
-/* File operations */
-struct timespec              dataModificationTime;
-static void updateMeasurementsPublisher(struct timespec, UA_UInt64);
-static void nanoSecondFieldConversion(struct timespec *);
 
 /* File to store the data and timestamps for different traffic */
 FILE*                        fpPublisher;
@@ -160,19 +168,32 @@ char*                        filePublishedData      = "publisher_T1.csv";
 UA_UInt64                    publishCounterValue[MAX_MEASUREMENTS];
 size_t                       measurementsPublisher  = 0;
 
-/* Array to store timestamp */
-struct timespec              publishTimestamp[MAX_MEASUREMENTS];
-
-/* Variable for next cycle start time */
-struct timespec              nextCycleStartTime;
-
 /* For one publish callback only... */
 UA_Server*                   pubServer;
 void*                        pubData;
 
+/* Variable for PubSub callback */
+UA_ServerCallback            pubCallback;
+
+/* Node ID*/
+UA_NodeId                    publishedDataSetIdent;
+UA_NodeId                    writerGroupIdent;
+UA_NodeId                    connectionIdent;
+
+/* Array to store timestamp */
+struct timespec              publishTimestamp[MAX_MEASUREMENTS];
+
+/* File operations */
+struct timespec              dataModificationTime;
+static void updateMeasurementsPublisher(struct timespec, UA_UInt64);
+static void nanoSecondFieldConversion(struct timespec *);
+
 #endif
 
 #if defined(SUBSCRIBER)
+
+UA_PubSubConnection*         connection;
+
 /* Variable for PubSub connection creation */
 UA_NodeId                    connectionIdentSubscriber;
 
@@ -199,6 +220,7 @@ void*                        subscriber(void* arg);
 
 /* OPCUA Subscribe API */
 void                         subscribe(void);
+
 #endif
 
 /* Stop signal */
@@ -207,11 +229,10 @@ static void stopHandler(int sign) {
     running = UA_FALSE;
 }
 
+/*****************************/
+/* Thread based callback     */
+/*****************************/
 #if defined(PUBLISHER)
-/*****************************/
-/* Thread based callback      */
-/*****************************/
-
 /* Add a callback for cyclic repetition */
 UA_StatusCode
 UA_PubSubManager_addRepeatedCallback(UA_Server *server, UA_ServerCallback callback,
@@ -227,25 +248,24 @@ UA_PubSubManager_addRepeatedCallback(UA_Server *server, UA_ServerCallback callba
 void
 UA_PubSubManager_removeRepeatedPubSubCallback(UA_Server *server, UA_UInt64 callbackId) {
  /*Since this is a custom while loop execution, no timer is required for this callback
- * function. So timer_delete() is not used
+ * function. So timer_delete() is not used and call back can be registered
  */
- pubCallback = NULL; /*So that new call back can be registered */
+ pubCallback = NULL;
 }
 #endif
 
-
+/*****************************/
+/* Interrupt based callback  */
+/*****************************/
 #if defined(PUB_SYSTEM_INTERRUPT)
-/*****************************/
-/* System Interrupt Callback */
-/*****************************/
-
+/* Signal handler */
 static void handler(int sig, siginfo_t *si, void *uc) { 
     
     if(firstTxTime == 0)
     {
         clock_gettime(CLOCKID, &nextCycleStartTime);
     	nextCycleStartTime.tv_sec += 0;
-
+    	/* Initial start time 100us offset */
     	nextCycleStartTime.tv_nsec += 1000000;
     	nanoSecondFieldConversion(&nextCycleStartTime);
         firstTxTime++;
@@ -261,51 +281,55 @@ static void handler(int sig, siginfo_t *si, void *uc) {
     UA_NodeId currentNodeId         = UA_NODEID_STRING(1, "PublisherCounter");
     UA_Server_writeValue(pubServer, currentNodeId, pubCounter);
     clock_gettime(CLOCKID, &dataModificationTime);
-    updateMeasurementsPublisher(dataModificationTime, pubCounterData);
+    if(measurementsPublisher < MAX_MEASUREMENTS) {
+        updateMeasurementsPublisher(dataModificationTime, pubCounterData);
+    }
+
     pubCallback(pubServer, pubData);
     if(si->si_value.sival_ptr != &pubEventTimer) { 
         UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "stray signal");
         return;
     }
+
 }
 
-static int setPrio(void)
+static int setSelfPrio(void)
 {
     int returnValue;
-    struct sched_param schedParamPublisher;
-    pthread_t pubThreadID;
+    struct sched_param schedSelf;
+    pthread_t mainRetID;
     int errorSetAffinity;
 
     /* Core affinity set for publisher */
-    cpu_set_t cpusetPub;
+    cpu_set_t cpusetMain;
 
-    /* Return the ID for publisher thread */
-    pubThreadID = pthread_self();
+    /* Return the ID for main thread */
+    mainRetID = pthread_self();
  
     /* sched_get_priority_max(SCHED_FIFO) */
-    schedParamPublisher.sched_priority = PUB_SCHED_PRIORITY;
+    schedSelf.sched_priority = PUB_SCHED_PRIORITY;
 
-    returnValue = pthread_setschedparam(pubThreadID, SCHED_FIFO, &schedParamPublisher);
+    returnValue = pthread_setschedparam(mainRetID, SCHED_FIFO, &schedSelf);
     if(returnValue != 0) {
         printf("pthread_setschedparam: failed\n");
         exit(1);
     }
 
-    CPU_ZERO(&cpusetPub);
-    CPU_SET(CORE_TWO, &cpusetPub);
-    errorSetAffinity = pthread_setaffinity_np(pubThreadID, sizeof(cpu_set_t), &cpusetPub);
+    CPU_ZERO(&cpusetMain);
+    CPU_SET(CORE_TWO, &cpusetMain);
+    errorSetAffinity = pthread_setaffinity_np(mainRetID, sizeof(cpu_set_t), &cpusetMain);
     if(errorSetAffinity) {
         fprintf(stderr, "pthread_setaffinity_np: %s\n", strerror(errorSetAffinity));
         return -1;
     }
 
-    printf("pthread_setschedparam: publisher thread priority is %d \n", schedParamPublisher.sched_priority);
-    returnValue = pthread_getaffinity_np(pubThreadID, sizeof(cpu_set_t), &cpusetPub);
+    printf("pthread_setschedparam: publisher thread priority is %d \n", schedSelf.sched_priority);
+    returnValue = pthread_getaffinity_np(mainRetID, sizeof(cpu_set_t), &cpusetMain);
     if(returnValue != 0) {
         printf("Get affinity fail\n");
     }
 
-    if(CPU_ISSET(CORE_TWO, &cpusetPub)) {
+    if(CPU_ISSET(CORE_TWO, &cpusetMain)) {
             printf("CPU %d\n", CORE_TWO);
     }
 
@@ -316,12 +340,19 @@ static int setPrio(void)
 UA_StatusCode
 UA_PubSubManager_addRepeatedCallback(UA_Server *server, UA_ServerCallback callback,
                                      void *data, UA_Double interval_ms, UA_UInt64 *callbackId) {
+	int  retVal;
+
     pubServer                       = server;
     pubCallback                     = callback;
     pubData                         = data;
     pubIntervalNs                   = (UA_Int64)(interval_ms * MILLI_SECONDS);
 
-    setPrio();
+    /*set self priority for the application */
+    retVal = setSelfPrio();
+    if(retVal != 0) {
+        printf("Not able to self priority\n");
+    }
+
     memset(&sa, 0, sizeof(sa));
     sa.sa_flags                     = SA_SIGINFO;
     sa.sa_sigaction                 = handler;
@@ -333,7 +364,7 @@ UA_PubSubManager_addRepeatedCallback(UA_Server *server, UA_ServerCallback callba
     pubEvent.sigev_notify           = SIGEV_SIGNAL;
     pubEvent.sigev_signo            = SIG;
     pubEvent.sigev_value.sival_ptr  = &pubEventTimer;
-    int resultTimerCreate           = timer_create(CLOCK_REALTIME, &pubEvent, &pubEventTimer);
+    int resultTimerCreate           = timer_create(CLOCKID, &pubEvent, &pubEventTimer);
     if(resultTimerCreate != 0) {
         UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Failed to create a system event");
         return UA_STATUSCODE_BADINTERNALERROR;
@@ -341,12 +372,11 @@ UA_PubSubManager_addRepeatedCallback(UA_Server *server, UA_ServerCallback callba
 
     /* Arm the timer */
     struct itimerspec timerspec;
-    timerspec.it_interval.tv_sec   = 0;
+    timerspec.it_interval.tv_sec   = (long int) (pubIntervalNs / (SECONDS));
     timerspec.it_interval.tv_nsec  = CYCLE_TIME;
-    timerspec.it_value.tv_sec      = 1;
-    timerspec.it_value.tv_nsec     = 0;
-    struct itimerspec oldtimerspec;
-    resultTimerCreate = timer_settime(pubEventTimer, 0, &timerspec, &oldtimerspec);
+    timerspec.it_value.tv_sec      = ONE_SECOND;
+    timerspec.it_value.tv_nsec     = (long int) (pubIntervalNs / (SECONDS));
+    resultTimerCreate = timer_settime(pubEventTimer, 0, &timerspec, NULL);
     if(resultTimerCreate != 0) {
         UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Failed to arm the system timer");
         timer_delete(pubEventTimer);
@@ -413,7 +443,7 @@ static void nanoSecondFieldConversion(struct timespec *timeSpecValue) {
     /* Check if ns field is greater than '1 ns less than 1sec' */
     while(timeSpecValue->tv_nsec > (SECONDS -1)) {
         /* Move to next second and remove it from ns field */
-        timeSpecValue->tv_sec  += ONE;
+        timeSpecValue->tv_sec  += ONE_SECOND;
         timeSpecValue->tv_nsec -= SECONDS;
     }
 }
@@ -464,27 +494,27 @@ addPublishedDataSet(UA_Server *server) {
 static void
 addDataSetField(UA_Server *server) {
     /* Add a field to the previous created PublishedDataSet */
-    UA_NodeId dataSetFieldIdent1;
-    UA_DataSetFieldConfig counterValue1;
-    memset(&counterValue1, 0, sizeof(UA_DataSetFieldConfig));
-    counterValue1.dataSetFieldType                                   = UA_PUBSUB_DATASETFIELD_VARIABLE;
-    counterValue1.field.variable.fieldNameAlias                      = UA_STRING("Counter Variable 1");
-    counterValue1.field.variable.promotedField                       = UA_FALSE;
-    counterValue1.field.variable.publishParameters.publishedVariable = pubNodeID;
-    counterValue1.field.variable.publishParameters.attributeId       = UA_ATTRIBUTEID_VALUE;
-    UA_Server_addDataSetField(server, publishedDataSetIdent, &counterValue1, &dataSetFieldIdent1);
+    UA_NodeId pubCounterFieldIdent;
+    UA_DataSetFieldConfig pubCounterField;
+    memset(&pubCounterField, 0, sizeof(UA_DataSetFieldConfig));
+    pubCounterField.dataSetFieldType                                   = UA_PUBSUB_DATASETFIELD_VARIABLE;
+    pubCounterField.field.variable.fieldNameAlias                      = UA_STRING("Pub Counter Dataset");
+    pubCounterField.field.variable.promotedField                       = UA_FALSE;
+    pubCounterField.field.variable.publishParameters.publishedVariable = pubNodeID;
+    pubCounterField.field.variable.publishParameters.attributeId       = UA_ATTRIBUTEID_VALUE;
+    UA_Server_addDataSetField(server, publishedDataSetIdent, &pubCounterField, &pubCounterFieldIdent);
 
-    UA_NodeId dataSetFieldIdent2;
-    UA_DataSetFieldConfig counterValue2;
-    memset(&counterValue2, 0, sizeof(UA_DataSetFieldConfig));
-    counterValue2.dataSetFieldType = UA_PUBSUB_DATASETFIELD_VARIABLE;
-    counterValue2.field.variable.fieldNameAlias                      = UA_STRING("Counter Variable 2");
-    counterValue2.field.variable.promotedField                       = UA_FALSE;
-    counterValue2.field.variable.publishParameters.publishedVariable = subNodeID;
-    counterValue2.field.variable.publishParameters.attributeId       = UA_ATTRIBUTEID_VALUE;
+    UA_NodeId subCounterFieldIdent;
+    UA_DataSetFieldConfig subCounterField;
+    memset(&subCounterField, 0, sizeof(UA_DataSetFieldConfig));
+    subCounterField.dataSetFieldType = UA_PUBSUB_DATASETFIELD_VARIABLE;
+    subCounterField.field.variable.fieldNameAlias                      = UA_STRING("Sub Counter Dataset");
+    subCounterField.field.variable.promotedField                       = UA_FALSE;
+    subCounterField.field.variable.publishParameters.publishedVariable = subNodeID;
+    subCounterField.field.variable.publishParameters.attributeId       = UA_ATTRIBUTEID_VALUE;
     /* Revert this line to add second node in the information model. As of now, dataSetFieldIdent1 is enough to send the counter data
      * on the network. */
-    UA_Server_addDataSetField(server, publishedDataSetIdent, &counterValue2, &dataSetFieldIdent2);
+    UA_Server_addDataSetField(server, publishedDataSetIdent, &subCounterField, &subCounterFieldIdent);
 }
 
 /**
@@ -536,11 +566,11 @@ void* publisherETF(void *arg) {
     struct timespec nextnanosleeptime;
     /* Get current time and compute the next nanosleeptime */
     clock_gettime(CLOCKID, &nextnanosleeptime);
-    /* Variable to nano Sleep until 1ms before a 1 second boundary */
     nextnanosleeptime.tv_sec   += 0;
-    nextnanosleeptime.tv_nsec  += 100000;
+    nextnanosleeptime.tv_nsec  += CYCLE_TIME;
     clock_gettime(CLOCKID, &nextCycleStartTime);
-    nextCycleStartTime.tv_sec  += 0; //NEXT_CYCLE_START_TIME;
+    nextCycleStartTime.tv_sec  += 0;
+    /* Initial offset */
     nextCycleStartTime.tv_nsec += 300000;
     while(running)
     {
@@ -551,7 +581,10 @@ void* publisherETF(void *arg) {
         UA_NodeId currentNodeId = UA_NODEID_STRING(1, "PublisherCounter");
         UA_Server_writeValue(pubServer, currentNodeId, pubCounter);
         pubCallback(pubServer, pubData);
-        updateMeasurementsPublisher(dataModificationTime, pubCounterData);
+        if(measurementsPublisher < MAX_MEASUREMENTS) {
+            updateMeasurementsPublisher(dataModificationTime, pubCounterData);
+        }
+
         nextnanosleeptime.tv_nsec += CYCLE_TIME;
         nanoSecondFieldConversion(&nextnanosleeptime);
         nextCycleStartTime.tv_nsec += CYCLE_TIME;
@@ -656,7 +689,7 @@ void subscribe(void) {
     }
     UA_UInt64 value = *(UA_UInt64 *)dsm->data.keyFrameData.dataSetFields[1].value.data;
     clock_gettime(CLOCKID, &dataReceiveTime);
-    if (value > 0) {
+    if (value > 0 && (measurementsSubscriber < MAX_MEASUREMENTS)) {
         updateMeasurementsSubscriber(dataReceiveTime, value);
     }
 cleanup:
@@ -725,10 +758,7 @@ static void removeServerNodes(UA_Server *server) {
 int main(void) {
     signal(SIGINT, stopHandler);
     signal(SIGTERM, stopHandler);
-
-
     UA_StatusCode    retval              = UA_STATUSCODE_GOOD;
-    
     UA_Server*       server              = UA_Server_new();
     UA_ServerConfig* config              = UA_Server_getConfig(server);
     UA_ServerConfig_setMinimal(config, PORT_NUMBER, NULL);
@@ -737,7 +767,7 @@ int main(void) {
     fpPublisher                          = fopen(filePublishedData, "a");
 #endif
 
-#if defined(PUBLISHER)
+#if defined(PUBLISHER) || defined (SUBSCRIBER)
     UA_Int32         errorSetAffinity    = 0;
     UA_Int32         returnValue         = 0;
 #endif
@@ -784,13 +814,6 @@ int main(void) {
     addDataSetField(server);
     addWriterGroup(server); 
     addDataSetWriter(server);
-#endif
-
-#if defined(PUBLISHER) || defined(SUBCRIBER)
-    if(pthread_mutex_init(&lock, NULL) != 0) {
-        printf("\n Mutex initialization has failed\n");
-        return 1;
-    }
 #endif
 
 #if defined(SUBSCRIBER)
