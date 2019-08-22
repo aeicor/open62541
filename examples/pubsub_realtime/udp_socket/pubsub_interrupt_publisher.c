@@ -47,13 +47,9 @@
 /* Use server interrupt or system interrupt? */
 //#define             PUB_SYSTEM_INTERRUPT
 /* Publish interval in milliseconds */
-#define             PUB_INTERVAL                    250
+#define             PUB_INTERVAL                    0.1
 /* Cycle time in ns. Eg: For 100us: 100*1000 */
 #define             CYCLE_TIME                      100 * 1000
-#define             SECONDS_SLEEP                   2
-#define             NANO_SECONDS_SLEEP              999000000
-#define             NEXT_CYCLE_START_TIME           3
-#define             CYCLE_TIME_NINTY_FIVE_PERCENT   0.95
 #define             FIVE_MICRO_SECOND               5
 #define             MILLI_SECONDS                   1000 * 1000
 #define             SECONDS                         1000 * 1000 * 1000
@@ -66,8 +62,6 @@
 #define             NETWORK_MSG_COUNT               1
 #define             CORE_TWO                        2
 #define             CORE_THREE                      3
-#define             TX_TIME_ONE                     1
-#define             TX_TIME_ZERO                    0
 #define             ONE                             1
 #define             CONNECTION_NUMBER               2
 #define             PORT_NUMBER                     62541
@@ -85,20 +79,16 @@
  * change in line number 46 in plugins/ua_pubsub_udp_custom_handling.c
  */
 #define             PUBSUB_IP_ADDRESS              "192.168.1.10"
-#if defined(PUBLISHER)
+#if defined(PUBLISHER) || defined(PUB_SYSTEM_INTERRUPT)
 #define             PUBLISHER_MULTICAST_ADDRESS    "opc.udp://224.0.0.22:4840/"
 #endif
 #if defined(SUBSCRIBER)
 #define             SUBSCRIBER_MULTICAST_ADDRESS   "opc.udp://224.0.0.32:4840/"
 #endif
-/* Variable for next cycle start time */
-struct timespec              nextCycleStartTime;
-/* When the timer was created */
-struct timespec              pubStartTime;
+
 /* Set server running as true */
 UA_Boolean                   running                = UA_TRUE;
-/* Interval in ns */
-UA_Int64                     pubIntervalNs;
+
 /* Variables corresponding to PubSub connection creation,
  * published data set and writer group */
 UA_PubSubConnection*         connection;
@@ -121,31 +111,64 @@ static void addServerNodes(UA_Server* server);
 /* For deleting the nodes created */
 static void removeServerNodes(UA_Server *server);
 
+#if defined(PUBLISHER)
+
 /* To lock the thread */
 pthread_mutex_t              lock;
-
-#if defined(PUBLISHER)
-/* File to store the data and timestamps for different traffic */
-FILE*                        fpPublisher;
-char*                        filePublishedData      = "publisher_T1.csv";
-
-/* Thread for publisher */
-pthread_t                    pubThreadID;
-
-/* Array to store published counter data */
-UA_UInt64                    publishCounterValue[MAX_MEASUREMENTS];
-size_t                       measurementsPublisher  = 0;
 
 /* Process scheduling parameter for publisher */
 struct sched_param           schedParamPublisher;
 
-/* Array to store timestamp */
-struct timespec              publishTimestamp[MAX_MEASUREMENTS];
+/* Thread for subscriber */
+pthread_t                    pubThreadID;
 
 /* Publisher thread routine for ETF */
 void*                        publisherETF(void* arg);
 #endif
 
+#if defined(PUB_SYSTEM_INTERRUPT)
+
+/* signal and event timer */
+struct sigevent              pubEvent;
+timer_t                      pubEventTimer;
+
+/* calculating firstTxtime */
+int                          firstTxTime           = 0; 
+
+/* Interval in ns */
+UA_Int64                     pubIntervalNs;
+
+/* Handle the signal */
+struct                       sigaction sa;
+#endif
+
+
+#if defined(PUBLISHER) || defined(PUB_SYSTEM_INTERRUPT)
+
+/* File operations */
+struct timespec              dataModificationTime;
+static void updateMeasurementsPublisher(struct timespec, UA_UInt64);
+static void nanoSecondFieldConversion(struct timespec *);
+
+/* File to store the data and timestamps for different traffic */
+FILE*                        fpPublisher;
+char*                        filePublishedData      = "publisher_T1.csv";
+
+/* Array to store published counter data */
+UA_UInt64                    publishCounterValue[MAX_MEASUREMENTS];
+size_t                       measurementsPublisher  = 0;
+
+/* Array to store timestamp */
+struct timespec              publishTimestamp[MAX_MEASUREMENTS];
+
+/* Variable for next cycle start time */
+struct timespec              nextCycleStartTime;
+
+/* For one publish callback only... */
+UA_Server*                   pubServer;
+void*                        pubData;
+
+#endif
 
 #if defined(SUBSCRIBER)
 /* Variable for PubSub connection creation */
@@ -182,19 +205,10 @@ static void stopHandler(int sign) {
     running = UA_FALSE;
 }
 
-struct timespec              dataModificationTime;
-
-static void updateMeasurementsPublisher(struct timespec, UA_UInt64);
-
-static void nanoSecondFieldConversion(struct timespec *);
-
 #if defined(PUBLISHER)
 /*****************************/
-/* System Interrupt Callback */
+/* Thread based callback      */
 /*****************************/
-/* For one publish callback only... */
-UA_Server*      pubServer;
-void*           pubData;
 
 /* Add a callback for cyclic repetition */
 UA_StatusCode
@@ -203,23 +217,17 @@ UA_PubSubManager_addRepeatedCallback(UA_Server *server, UA_ServerCallback callba
     pubServer                       = server;
     pubCallback                     = callback;
     pubData                         = data;
-    pubIntervalNs                   = (UA_Int64)interval_ms * MILLI_SECONDS;
-
-    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                "Created Publish Callback with interval %f", interval_ms);
-    return UA_STATUSCODE_GOOD;
-}
-
-UA_StatusCode
-UA_PubSubManager_changeRepeatedCallbackInterval(UA_Server *server, UA_UInt64 callbackId,
-                                                UA_Double interval_ms) {
+    
     return UA_STATUSCODE_GOOD;
 }
 
 /* Remove the callback added for cyclic repetition */
 void
 UA_PubSubManager_removeRepeatedPubSubCallback(UA_Server *server, UA_UInt64 callbackId) {
-    
+ /*Since this is a custom while loop execution, no timer is required for this callback
+ * function. So timer_delete() is not used
+ */
+ pubCallback = NULL; /*So that new call back can be registered */
 }
 #endif
 
@@ -228,25 +236,17 @@ UA_PubSubManager_removeRepeatedPubSubCallback(UA_Server *server, UA_UInt64 callb
 /*****************************/
 /* System Interrupt Callback */
 /*****************************/
-/* For one publish callback only... */
-UA_Server*      pubServer;
-void*           pubData;
-struct sigevent pubEvent;
-timer_t         pubEventTimer;
-int             firstTxTime = 1;
 
 static void handler(int sig, siginfo_t *si, void *uc) { 
-    firstTxTime++;
-    if (firstTxTime < 4)
-	return;
-
-    if(firstTxTime == 4)
+    
+    if(firstTxTime == 0)
     {
         clock_gettime(CLOCKID, &nextCycleStartTime);
     	nextCycleStartTime.tv_sec += 0;
 
-    	nextCycleStartTime.tv_nsec += 1000000;
+    	nextCycleStartTime.tv_nsec += 300000;
     	nanoSecondFieldConversion(&nextCycleStartTime);
+        firstTxTime++;
     }
     else
     {
@@ -261,6 +261,7 @@ static void handler(int sig, siginfo_t *si, void *uc) {
     UA_Server_writeValue(pubServer, currentNodeId, pubCounter);
     clock_gettime(CLOCKID, &dataModificationTime);
     updateMeasurementsPublisher(dataModificationTime, pubCounterData);
+    printf("Call back called\n");
     pubCallback(pubServer, pubData);
     if(si->si_value.sival_ptr != &pubEventTimer) { 
         UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "stray signal");
@@ -276,17 +277,17 @@ UA_PubSubManager_addRepeatedCallback(UA_Server *server, UA_ServerCallback callba
     pubServer                       = server;
     pubCallback                     = callback;
     pubData                         = data;
-    pubIntervalNs                   = (UA_Int64)interval_ms * MILLI_SECONDS;
+    pubIntervalNs                   = (UA_Int64)(interval_ms * MILLI_SECONDS);
 
-    /* Handle the signal */
-    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
     sa.sa_flags                     = SA_SIGINFO;
     sa.sa_sigaction                 = handler;
     sigemptyset(&sa.sa_mask);
     sigaction(SIG, &sa, NULL);
 
     /* Create the event */
-    pubEvent.sigev_notify           = SIGEV_NONE;
+    memset(&pubEventTimer, 0, sizeof(pubEventTimer));
+    pubEvent.sigev_notify           = SIGEV_SIGNAL;
     pubEvent.sigev_signo            = SIG;
     pubEvent.sigev_value.sival_ptr  = &pubEventTimer;
     int resultTimerCreate           = timer_create(CLOCKID, &pubEvent, &pubEventTimer);
@@ -295,13 +296,13 @@ UA_PubSubManager_addRepeatedCallback(UA_Server *server, UA_ServerCallback callba
         return UA_STATUSCODE_BADINTERNALERROR;
     }
 
+    printf("Handler callback time %ld", (long int) (pubIntervalNs % (SECONDS)));
     /* Arm the timer */
     struct itimerspec timerspec;
-
-    timerspec.it_interval.tv_sec   = 0;
-    timerspec.it_interval.tv_nsec  = 100000;
-    timerspec.it_value.tv_sec      = 0;
-    timerspec.it_value.tv_nsec     = 1;
+    timerspec.it_interval.tv_sec   = (long int) (pubIntervalNs / (SECONDS));
+    timerspec.it_interval.tv_nsec  = (long int) (pubIntervalNs % (SECONDS));
+    timerspec.it_value.tv_sec      = (long int) (pubIntervalNs / (SECONDS));
+    timerspec.it_value.tv_nsec     = (long int) (pubIntervalNs % (SECONDS));
     resultTimerCreate = timer_settime(pubEventTimer, 0, &timerspec, NULL);
     if(resultTimerCreate != 0) {
         UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Failed to arm the system timer");
@@ -309,7 +310,6 @@ UA_PubSubManager_addRepeatedCallback(UA_Server *server, UA_ServerCallback callba
         return UA_STATUSCODE_BADINTERNALERROR;
     }
 
-    clock_gettime(CLOCKID, &pubStartTime);
     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                 "Created Publish Callback with interval %f", interval_ms);
     return UA_STATUSCODE_GOOD;
@@ -318,12 +318,12 @@ UA_PubSubManager_addRepeatedCallback(UA_Server *server, UA_ServerCallback callba
 UA_StatusCode
 UA_PubSubManager_changeRepeatedCallbackInterval(UA_Server *server, UA_UInt64 callbackId,
                                                 UA_Double interval_ms) {
-    pubIntervalNs                 = (UA_Int64)interval_ms * MILLI_SECONDS;
+    pubIntervalNs                 = (UA_Int64)(interval_ms * MILLI_SECONDS);
     struct itimerspec timerspec;
-    timerspec.it_interval.tv_sec  = 0;
-    timerspec.it_interval.tv_nsec = pubIntervalNs;
-    timerspec.it_value.tv_sec     = 0;
-    timerspec.it_value.tv_nsec    = 0;
+    timerspec.it_interval.tv_sec   = (long int) (pubIntervalNs / (SECONDS));
+    timerspec.it_interval.tv_nsec  = (long int) (pubIntervalNs % (SECONDS));
+    timerspec.it_value.tv_sec      = (long int) (pubIntervalNs / (SECONDS));
+    timerspec.it_value.tv_nsec     = (long int) (pubIntervalNs % (SECONDS));
     int resultTimerCreate         = timer_settime(pubEventTimer, 0, &timerspec, NULL);
     if(resultTimerCreate != 0) {
         UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Failed to arm the system timer");
@@ -338,13 +338,43 @@ UA_PubSubManager_changeRepeatedCallbackInterval(UA_Server *server, UA_UInt64 cal
 
 /* Remove the callback added for cyclic repetition */
 void
-UA_PubSubManager_removeRepeatedPubSubCallback(UA_Server *server, UA_UInt64 callbackId) {
-	printf("Timer event deleted\n");
+UA_PubSubManager_removeRepeatedPubSubCallback(UA_Server *server, UA_UInt64 callbackId) { 
+    printf("Timer event deleted\n");
     timer_delete(pubEventTimer);
+    pubCallback = NULL;
 }
 #endif
 
-#if defined(PUBLISHER)
+#if defined(PUBLISHER) || defined(PUB_SYSTEM_INTERRUPT)
+/**
+ * **Published data handling**
+ *
+ * The published data is updated in the array using this function
+ */
+ static void
+updateMeasurementsPublisher(struct timespec start_time,
+                            UA_UInt64 counterValue) {
+    publishTimestamp[measurementsPublisher]        = start_time;
+    publishCounterValue[measurementsPublisher]     = counterValue;
+    measurementsPublisher++;
+}
+
+/**
+ * **Nanosecond field handling**
+ *
+ * Nanosecond field in timespec is checked for overflowing and one second
+ * is added to seconds field and nanosecond field is set to zero
+*/
+
+static void nanoSecondFieldConversion(struct timespec *timeSpecValue) {
+    /* Check if ns field is greater than '1 ns less than 1sec' */
+    while(timeSpecValue->tv_nsec > (SECONDS -1)) {
+        /* Move to next second and remove it from ns field */
+        timeSpecValue->tv_sec  += ONE;
+        timeSpecValue->tv_nsec -= SECONDS;
+    }
+}
+
 /**
  * **PubSub connection handling**
  *
@@ -449,37 +479,10 @@ addDataSetWriter(UA_Server *server) {
     UA_Server_addDataSetWriter(server, writerGroupIdent, publishedDataSetIdent,
                                &dataSetWriterConfig, &dataSetWriterIdent);
 }
+#endif
 
 
-/**
- * **Published data handling**
- *
- * The published data is updated in the array using this function
- */
- static void
-updateMeasurementsPublisher(struct timespec start_time,
-                            UA_UInt64 counterValue) {
-    publishTimestamp[measurementsPublisher]        = start_time;
-    publishCounterValue[measurementsPublisher]     = counterValue;
-    measurementsPublisher++;
-}
-
-/**
- * **Nanosecond field handling**
- *
- * Nanosecond field in timespec is checked for overflowing and one second
- * is added to seconds field and nanosecond field is set to zero
-*/
-
-static void nanoSecondFieldConversion(struct timespec *timeSpecValue) {
-    /* Check if ns field is greater than '1 ns less than 1sec' */
-    while(timeSpecValue->tv_nsec > (SECONDS -1)) {
-        /* Move to next second and remove it from ns field */
-        timeSpecValue->tv_sec  += ONE;
-        timeSpecValue->tv_nsec -= SECONDS;
-    }
-}
-
+#if defined(PUBLISHER)
 /**
  * **Publisher thread routine**
  *
@@ -680,16 +683,22 @@ int main(void) {
     signal(SIGINT, stopHandler);
     signal(SIGTERM, stopHandler);
 
-    UA_Int32         returnValue         = 0;
+
     UA_StatusCode    retval              = UA_STATUSCODE_GOOD;
-    UA_Int32         errorSetAffinity    = 0;
+    
     UA_Server*       server              = UA_Server_new();
     UA_ServerConfig* config              = UA_Server_getConfig(server);
     UA_ServerConfig_setMinimal(config, PORT_NUMBER, NULL);
 
-#if defined(PUBLISHER)
+#if defined(PUBLISHER) || defined(PUB_SYSTEM_INTERRUPT)
     fpPublisher                          = fopen(filePublishedData, "a");
 #endif
+
+#if defined(PUBLISHER)
+    UA_Int32         errorSetAffinity    = 0;
+    UA_Int32         returnValue         = 0;
+#endif
+
 #if defined(SUBSCRIBER)
     fpSubscriber                         = fopen(fileSubscribedData, "a");
 #endif
@@ -720,24 +729,26 @@ int main(void) {
     config->pubsubTransportLayersSize++;
 #endif
 
-#if defined(PUBLISHER) || defined(SUBSCRIBER)
+#if defined(PUBLISHER) || defined(SUBSCRIBER) || defined(PUB_SYSTEM_INTERRUPT)
     /* Server is the new OPCUA model which has both publisher and subscriber configuration
      * add axis node and OPCUA pubsub client server counter nodes */
     addServerNodes(server);
 #endif
 
-#if defined(PUBLISHER)
+#if defined(PUBLISHER) || defined(PUB_SYSTEM_INTERRUPT)
     addPubSubConnection(server);
     addPublishedDataSet(server);
     addDataSetField(server);
-    addWriterGroup(server);
+    addWriterGroup(server); 
     addDataSetWriter(server);
 #endif
 
+#if defined(PUBLISHER) || defined(SUBCRIBER)
     if(pthread_mutex_init(&lock, NULL) != 0) {
         printf("\n Mutex initialization has failed\n");
         return 1;
     }
+#endif
 
 #if defined(SUBSCRIBER)
     /* Details about the connection configuration and handling are located
@@ -835,7 +846,7 @@ int main(void) {
     }
 #endif
 
-#if defined(PUBLISHER) || defined(SUBSCRIBER)
+#if defined(PUBLISHER) || defined(SUBSCRIBER) || defined(PUB_SYSTEM_INTERRUPT)
     retval |= UA_Server_run(server, &running);
 #endif
 
@@ -853,7 +864,7 @@ int main(void) {
     }
 #endif
 
-#if defined(PUBLISHER)
+#if defined(PUBLISHER) || defined(PUB_SYSTEM_INTERRUPT)
     /* Write the published data in the publisher_T1.csv file */
     size_t pubLoopVariable               = 0;
     for (pubLoopVariable = 0; pubLoopVariable < measurementsPublisher;
@@ -876,12 +887,12 @@ int main(void) {
     }
 #endif
 
-#if defined(PUBLISHER) || defined(SUBSCRIBER)
+#if defined(PUBLISHER) || defined(PUB_SYSTEM_INTERRUPT) || defined(SUBSCRIBER)
     removeServerNodes(server);
     UA_Server_delete(server);
 #endif
 
-#if defined(PUBLISHER)
+#if defined(PUBLISHER) || defined(PUB_SYSTEM_INTERRUPT)
 fclose(fpPublisher);
 #endif
 
